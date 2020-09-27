@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Zebra</string>
+    <string name="select_app">Choose app</string>
+    <string name="export_succeed">Export succeed</string>
+    <string name="export_failed">Export failed</string>
+
+    <!-- Error Code -->
+    <string name="error_unknown">Unknown error</string>
+    <string name="error_file_not_found">File not found</string>
+</resources>
