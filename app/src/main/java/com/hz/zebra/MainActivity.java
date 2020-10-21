@@ -12,8 +12,10 @@ import android.os.Bundle;
 import android.util.Log;
 import android.view.View;
 import android.webkit.JavascriptInterface;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.Toast;
 
 import org.json.JSONArray;
@@ -24,6 +26,8 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -91,6 +95,27 @@ class StreamUtils {
     }
 }
 
+class JsSettingsUtils {
+    public static String generate(Map<String, String> map) {
+        String before = "zebra-settings {";
+        String after = "}";
+        String insert = ":";
+        String separator = ";";
+
+        StringBuilder content = new StringBuilder();
+        content.append(before);
+        for (Map.Entry<String, String> entry : map.entrySet()) {
+            content.append(entry.getKey());
+            content.append(insert);
+            content.append(entry.getValue());
+            content.append(separator);
+        }
+        content.append(after);
+
+        return content.toString();
+    }
+}
+
 public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_CODE_JS_IMPORT_FILE = 1;
     private static final int REQUEST_CODE_JS_EXPORT_FILE = 2;
@@ -113,13 +138,26 @@ public class MainActivity extends AppCompatActivity {
         WebSettings settings = mMainView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setJavaScriptCanOpenWindowsAutomatically(true);
-        settings.setUserAgentString("platform:android;");
 
+        // Set browser user-agent, this is used as config for our app
+        Map<String, String> ua = new HashMap<String, String>();
+        ua.put("platform", "android");
+        settings.setUserAgentString(JsSettingsUtils.generate(ua));
+
+        // Add our platform interface
         mJsPlatform = new JsPlatform();
-        mMainView.addJavascriptInterface(mJsPlatform, "PlatformAndroid");
+        mMainView.addJavascriptInterface(mJsPlatform, "platformAndroid");
+
+        // Add WebViewClient to make it possible to jump between different html
+        mMainView.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                return false;
+            }
+        });
 
         // Load our web
-        mMainView.loadUrl("file:///android_asset/web/index.html");
+        mMainView.loadUrl("file:///android_asset/web/login.html");
     }
 
     @Override
