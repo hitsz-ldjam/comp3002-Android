@@ -2,15 +2,24 @@ package com.hz.zebra;
 
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.FileProvider;
+import androidx.core.hardware.fingerprint.FingerprintManagerCompat;
+import androidx.core.os.CancellationSignal;
+import androidx.security.crypto.EncryptedSharedPreferences;
+import androidx.security.crypto.MasterKeys;
 
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.res.Resources;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
+import android.telecom.Call;
+import android.util.Base64;
 import android.util.Log;
-import android.view.View;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -26,10 +35,23 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.security.AlgorithmParameters;
+import java.security.GeneralSecurityException;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.NoSuchProviderException;
+import java.security.UnrecoverableKeyException;
+import java.security.cert.CertificateException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+
 
 enum ErrorCode {
     NO_ERROR,
@@ -116,6 +138,113 @@ class JsSettingsUtils {
     }
 }
 
+class KeyStoreWrapper {
+    public static final String ALIAS_DEFAULT_KEY = "__ZEBRA_KEY__";
+    public static final String SHARED_PREFERENCES_FILENAME = "__ZEBRA_PREFS__";
+
+    private static final String PROVIDER_NAME = "AndroidKeyStore";
+
+    private KeyStore mKeyStore;
+    private SharedPreferences mSharedPreferences;
+
+    public KeyStoreWrapper() {
+        try {
+            mKeyStore = KeyStore.getInstance(PROVIDER_NAME);
+            mKeyStore.load(null);
+        } catch (KeyStoreException | IOException | NoSuchAlgorithmException | CertificateException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public boolean createSecretKey(String alias) {
+        if (hasSecretKey(alias)) {
+            return false;
+        }
+
+        try {
+            KeyGenerator keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, PROVIDER_NAME);
+
+            KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_DECRYPT | KeyProperties.PURPOSE_ENCRYPT
+            ).setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build();
+
+            keyGenerator.init(spec);
+            keyGenerator.generateKey();
+            Log.w("KeyStore", "Secret key [" + alias + "] generated");
+            return true;
+        } catch (NoSuchAlgorithmException | NoSuchProviderException | InvalidAlgorithmParameterException e) {
+            e.printStackTrace();
+            Log.w("KeyStore", "Failed to generate secret key [" + alias + "]");
+            return false;
+        }
+    }
+
+    public SecretKey getSecretKey(String alias) {
+        try {
+            return (SecretKey) mKeyStore.getKey(alias, null);
+        } catch (NoSuchAlgorithmException | UnrecoverableKeyException | KeyStoreException e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    public boolean hasSecretKey(String alias) {
+        try {
+            return alias != null && mKeyStore.containsAlias(alias);
+        } catch (KeyStoreException e) {
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    public void deleteSecretKey(String alias) {
+        try {
+            mKeyStore.deleteEntry(alias);
+        } catch (KeyStoreException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public boolean loadSharedPreferences(Context context, String secretKeyAlias) {
+        if (hasSecretKey(secretKeyAlias)) {
+            try {
+                mSharedPreferences = EncryptedSharedPreferences.create(SHARED_PREFERENCES_FILENAME,
+                        secretKeyAlias,
+                        context,
+                        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM);
+                return true;
+            } catch (GeneralSecurityException | IOException e) {
+                e.printStackTrace();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    public boolean saveToSharedPreferences(String key, String value) {
+        if (mSharedPreferences != null) {
+            SharedPreferences.Editor editor = mSharedPreferences.edit();
+            editor.putString(key, value);
+            editor.apply();
+            return true;
+        }
+        return false;
+    }
+
+    public String loadFromSharedPreferences(String key) {
+        if (mSharedPreferences != null) {
+            return mSharedPreferences.getString(key, null);
+        }
+        return null;
+    }
+
+    public void removeFromSharedPreferences(String key) {
+        if (mSharedPreferences != null) {
+            mSharedPreferences.edit().remove(key).apply();
+        }
+    }
+}
+
 public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_CODE_JS_IMPORT_FILE = 1;
     private static final int REQUEST_CODE_JS_EXPORT_FILE = 2;
@@ -124,15 +253,12 @@ public class MainActivity extends AppCompatActivity {
     private String mJsRequestedData;
     private ExecutorService mIOExecutor;
     private JsPlatform mJsPlatform;
+    private KeyStoreWrapper mKeyStore;
 
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main);
+    private static final String KEY_SUB_PWD = "__ZEBRA_SUB_PWD__";
+    private static final String KEY_KEY = "__ZEBRA_KEY__";
 
-        // Create IO executor
-        mIOExecutor = Executors.newSingleThreadExecutor();
-
+    private void InitWebView() {
         // Enable javascript
         mMainView = (WebView) findViewById(R.id.main_view);
         WebSettings settings = mMainView.getSettings();
@@ -148,6 +274,14 @@ public class MainActivity extends AppCompatActivity {
         mJsPlatform = new JsPlatform();
         mMainView.addJavascriptInterface(mJsPlatform, "platformAndroid");
 
+        // Disable scroll bar
+        mMainView.setVerticalScrollBarEnabled(false);
+        mMainView.setHorizontalScrollBarEnabled(false);
+
+        // Disable zoom
+        settings.setBuiltInZoomControls(false);
+        settings.setSupportZoom(false);
+
         // Add WebViewClient to make it possible to jump between different html
         mMainView.setWebViewClient(new WebViewClient() {
             @Override
@@ -155,9 +289,27 @@ public class MainActivity extends AppCompatActivity {
                 return false;
             }
         });
+    }
 
+    private void InitKeyStore() {
+        mKeyStore = new KeyStoreWrapper();
+        if (!mKeyStore.hasSecretKey(KeyStoreWrapper.ALIAS_DEFAULT_KEY)) {
+            mKeyStore.createSecretKey(KeyStoreWrapper.ALIAS_DEFAULT_KEY);
+        }
+        mKeyStore.loadSharedPreferences(getApplicationContext(), KeyStoreWrapper.ALIAS_DEFAULT_KEY);
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        // Create IO executor
+        mIOExecutor = Executors.newSingleThreadExecutor();
+        InitWebView();
+        InitKeyStore();
         // Load our web
-        mMainView.loadUrl("file:///android_asset/web/login.html");
+        mMainView.loadUrl("file:///android_asset/web/index.html");
     }
 
     @Override
@@ -321,6 +473,8 @@ public class MainActivity extends AppCompatActivity {
     ///////////////////////////////////////////////////////
 
     class JsPlatform {
+        private static final String TAG = "JsPlatform";
+
         public void onFileImporterResult() {
             mMainView.evaluateJavascript("platform._onFileImporterResult();", null);
         }
@@ -332,6 +486,21 @@ public class MainActivity extends AppCompatActivity {
         @JavascriptInterface
         public void showMessage(String message) {
             showToast(message);
+        }
+
+        @JavascriptInterface
+        public void logMessage(String message) {
+            Log.i(TAG, message);
+        }
+
+        @JavascriptInterface
+        public void logError(String error) {
+            Log.e(TAG, error);
+        }
+
+        @JavascriptInterface
+        public void logWTF(String wtf) {
+            Log.wtf(TAG, wtf);
         }
 
         @JavascriptInterface
@@ -389,7 +558,41 @@ public class MainActivity extends AppCompatActivity {
             mJsRequestedData = null;
             return data;
         }
+
+        @JavascriptInterface
+        public void saveSubPair(String subpwd, String key) {
+            mKeyStore.saveToSharedPreferences(KEY_SUB_PWD, subpwd);
+            mKeyStore.saveToSharedPreferences(KEY_KEY, key);
+        }
+
+        @JavascriptInterface
+        public void clearSubPair() {
+            mKeyStore.removeFromSharedPreferences(KEY_SUB_PWD);
+            mKeyStore.removeFromSharedPreferences(KEY_KEY);
+        }
+
+        @JavascriptInterface
+        public boolean hasSubPair() {
+            return mKeyStore.loadFromSharedPreferences(KEY_SUB_PWD) != null;
+        }
+
+        @JavascriptInterface
+        public String getSubPair() {
+            /*
+             * {
+             *     "subpwd":"",
+             *     "key":""
+             * }
+             */
+            if(hasSubPair()){
+                String subpwd = mKeyStore.loadFromSharedPreferences(KEY_SUB_PWD);
+                String key = mKeyStore.loadFromSharedPreferences(KEY_KEY);
+                String result = String.format("{\"subpwd\":\"%s\", \"key\":\"%s\"}", subpwd, key);
+                Log.w("JsPlatform", result);
+                return result;
+            } else{
+                return null;
+            }
+        }
     }
-
-
 }
